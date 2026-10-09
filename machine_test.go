@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -272,6 +273,159 @@ func TestHeldOutPatternBeatsNoise(t *testing.T) {
 	}
 	if hard.Bits <= easy.Bits+2 {
 		t.Fatalf("easy %v hard %v", easy.Bits, hard.Bits)
+	}
+}
+
+func TestKnownProbUnchangedByChars(t *testing.T) {
+	m := train(t, 1, "xx yy xx yy")
+	if m.chars != nil {
+		t.Fatal("Train trained the character model")
+	}
+	before := m.prob(context{}, m.ids["xx"], 1)
+	if err := m.trainChars([]string{"ab", "ab", "cd"}); err != nil {
+		t.Fatal(err)
+	}
+	after := m.prob(context{}, m.ids["xx"], 1)
+	if before != after {
+		t.Fatalf("known probability moved: %v -> %v", before, after)
+	}
+	// The end-of-word mark is the last symbol of each spelling, so it
+	// never predicts the next word's first letter.
+	eowID := m.chars.ids[eow]
+	cross := context{n: 1, w: [maxOrder]uint32{eowID}}
+	if d := m.chars.trans[cross]; d != nil && d.total > 0 {
+		t.Fatal("character context crossed a word boundary")
+	}
+}
+
+func TestOOVUsesSpelling(t *testing.T) {
+	var b strings.Builder
+	for i := range 30 {
+		b.WriteByte('w')
+		b.WriteString(strconv.Itoa(i))
+		b.WriteByte(' ')
+	}
+	text := b.String()
+	m := train(t, 1, text)
+	words := make([]string, 40)
+	for i := range words {
+		words[i] = "ab"
+	}
+	if err := m.trainChars(words); err != nil {
+		t.Fatal(err)
+	}
+	pBin := m.prob(context{}, unkID, 1)
+	pSpell := m.spellProb("ab")
+	p := m.probOOV(context{}, "ab", 1)
+	want := pBin * float64(len(m.vocab)+1) * pSpell
+	if math.Abs(p-want) > 1e-12 {
+		t.Fatalf("p=%v want %v", p, want)
+	}
+	if p <= pBin {
+		t.Fatalf("spelling should beat the unknown bin: spell %v bin %v oov %v", pSpell, pBin, p)
+	}
+	plain := train(t, 1, text)
+	evPlain, err := plain.Score(nil, []string{"w0", "ab"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, err := m.Score(nil, []string{"w0", "ab"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.KnownBits != evPlain.KnownBits || ev.KnownTokens != 1 || ev.OOV != 1 {
+		t.Fatalf("known %+v plain %+v", ev, evPlain)
+	}
+	if ev.Bits >= evPlain.Bits {
+		t.Fatalf("spelling did not help: plain %v spelled %v", evPlain.Bits, ev.Bits)
+	}
+	if _, known := m.ids["ab"]; known {
+		t.Fatal("scoring interned an unknown token")
+	}
+}
+
+func TestFrequentSpellingMoreLikely(t *testing.T) {
+	m := train(t, 1, "xx yy")
+	words := make([]string, 0, 41)
+	for range 40 {
+		words = append(words, "cat")
+	}
+	words = append(words, "dog")
+	if err := m.trainChars(words); err != nil {
+		t.Fatal(err)
+	}
+	if m.spellProb("cat") <= m.spellProb("dog") {
+		t.Fatalf("cat %v dog %v", m.spellProb("cat"), m.spellProb("dog"))
+	}
+}
+
+func TestImplausibleSpellingKeepsBin(t *testing.T) {
+	const text = "xx yy xx yy"
+	m := train(t, 1, text)
+	if err := m.trainChars([]string{"ab", "cd"}); err != nil {
+		t.Fatal(err)
+	}
+	plain := train(t, 1, text)
+	got, err := m.Score(nil, []string{"qqqq"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := plain.Score(nil, []string{"qqqq"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(got.Bits-want.Bits) > 1e-9 {
+		t.Fatalf("implausible spelling changed the score: got %v want %v", got.Bits, want.Bits)
+	}
+}
+
+func TestSpellPrefersTrainedWord(t *testing.T) {
+	m := train(t, 1, "xx yy")
+	words := make([]string, 40)
+	for i := range words {
+		words[i] = "cat"
+	}
+	if err := m.trainChars(words); err != nil {
+		t.Fatal(err)
+	}
+	if m.spellProb("cat") <= m.spellProb("qqqq") {
+		t.Fatalf("cat %v qqqq %v", m.spellProb("cat"), m.spellProb("qqqq"))
+	}
+}
+
+func TestSpellNovelInterns(t *testing.T) {
+	m := train(t, 1, "aa bb aa bb")
+	words := make([]string, 50)
+	for i := range words {
+		words[i] = "cat"
+	}
+	if err := m.trainChars(words); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context{n: 1, w: [maxOrder]uint32{m.ids["aa"]}}
+	total := m.trans[ctx].total
+	before := len(m.vocab)
+	saw := false
+	r := rng(1)
+	for range 400 {
+		id := m.drawBase(r)
+		if int(id) < before {
+			continue
+		}
+		if m.vocab[id] == "" {
+			t.Fatal("empty spelling")
+		}
+		saw = true
+		break
+	}
+	if !saw {
+		t.Fatal("base draw never spelled a new word")
+	}
+	if m.tokens != 4 {
+		t.Fatalf("tokens %d", m.tokens)
+	}
+	if m.trans[ctx].total != total {
+		t.Fatal("spelling a word counted it")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"strings"
 )
 
 const (
@@ -22,6 +23,18 @@ const (
 	// unkID is a held-out symbol the machine has not learned. It is not
 	// a vocab index.
 	unkID = ^uint32(0)
+	// eow ends a word in the character model. Private use keeps it out
+	// of any training text.
+	eow = "\uE000"
+	// charOrder is the Markov order of the model that spells a word
+	// the word model has never seen. That model discounts raw counts
+	// at every length, so a frequent spelling stays frequent.
+	charOrder = 5
+	// maxSpell is the longest spelling the character model will write.
+	maxSpell = 64
+	// spellTries is how many spellings to draw before giving up on a
+	// word that is not already in the vocabulary.
+	spellTries = 8
 )
 
 // context is the finite-control state: the last n symbols written to
@@ -316,17 +329,24 @@ func (t *Tape) state(order int) context {
 // counts: how many distinct longer contexts produced that symbol, not
 // how often the symbol itself occurred. The shortest distribution backs
 // off to a uniform bin over the known symbols and one unknown symbol.
-// Temperature reshapes the discounted counts at each level and does not
-// change how much mass escapes.
+// A character model can replace that bin with the probability of
+// spelling the unknown word, including an end-of-word mark, when the
+// spelling is more probable than the bin. Known symbols stay on this
+// distribution. Temperature reshapes the discounted counts at each
+// level and does not change how much mass escapes. It does not reshape
+// spellings.
 type Machine struct {
-	order  int
-	vocab  []string
-	ids    map[string]uint32
-	trans  map[context]*dist
-	cont   map[context]*dist
-	disc   [maxOrder + 1]float64
-	discOK bool
-	tokens int
+	order      int
+	vocab      []string
+	ids        map[string]uint32
+	trans      map[context]*dist
+	cont       map[context]*dist
+	disc       [maxOrder + 1]float64
+	discOK     bool
+	tokens     int
+	rawLower   bool
+	chars      *Machine
+	spellCache map[string]float64
 }
 
 // New returns a machine that conditions each symbol on at most order
@@ -372,7 +392,8 @@ func (m *Machine) observe(ctx context, sym uint32) {
 		first := m.addRaw(ctx, sym)
 		// A first sighting of this context is one distinct left extension
 		// of the suffix, which is what the lower-order model counts.
-		if first && ctx.n > 0 {
+		// A raw lower order keeps the counts instead, so frequency survives.
+		if first && ctx.n > 0 && !m.rawLower {
 			m.addCont(ctx.dropOldest(), sym)
 		}
 		if ctx.n == 0 {
@@ -405,15 +426,16 @@ func (m *Machine) addCont(ctx context, sym uint32) {
 // ensureDiscount estimates one absolute discount per context length.
 // D = n1 / (n1 + 2*n2), with n1 and n2 the number of successors seen
 // once and twice. The longest context uses raw counts. Shorter contexts
-// use continuation counts. A length with no singletons keeps a
-// discount of 0.5 so an unseen symbol still escapes.
+// use continuation counts, unless this model keeps raw counts at every
+// length. A length with no singletons keeps a discount of 0.5 so an
+// unseen symbol still escapes.
 func (m *Machine) ensureDiscount() {
 	if m.discOK {
 		return
 	}
 	var n1, n2 [maxOrder + 1]int
 	for ctx, d := range m.trans {
-		if int(ctx.n) != m.order {
+		if !m.rawLower && int(ctx.n) != m.order {
 			continue
 		}
 		for _, c := range d.cnt {
@@ -425,13 +447,15 @@ func (m *Machine) ensureDiscount() {
 			}
 		}
 	}
-	for ctx, d := range m.cont {
-		for _, c := range d.cnt {
-			switch c {
-			case 1:
-				n1[ctx.n]++
-			case 2:
-				n2[ctx.n]++
+	if !m.rawLower {
+		for ctx, d := range m.cont {
+			for _, c := range d.cnt {
+				switch c {
+				case 1:
+					n1[ctx.n]++
+				case 2:
+					n2[ctx.n]++
+				}
 			}
 		}
 	}
@@ -456,9 +480,10 @@ func (m *Machine) baseProb() float64 {
 }
 
 // levelDist is the raw distribution at the longest context and the
-// continuation distribution at every shorter one.
+// continuation distribution at every shorter one. Raw lower orders
+// use the raw distribution at every length.
 func (m *Machine) levelDist(ctx context) *dist {
-	if int(ctx.n) == m.order {
+	if m.rawLower || int(ctx.n) == m.order {
 		return m.trans[ctx]
 	}
 	return m.cont[ctx]
@@ -509,24 +534,84 @@ func (m *Machine) sample(ctx context, rng *rand.Rand, temp float64) (uint32, boo
 	return m.sampleFrom(ctx, rng, temp), true
 }
 
-// sampleFrom draws from the same interpolation as prob. The base draw
-// stays inside the vocabulary: there is no unknown symbol to write.
+// sampleFrom draws from the same interpolation as prob. At the empty
+// context the word model can spend its unknown-symbol slot on a
+// spelling it has not written before.
 func (m *Machine) sampleFrom(ctx context, rng *rand.Rand, temp float64) uint32 {
 	d := m.levelDist(ctx)
 	if d == nil || d.total == 0 || len(d.sym) == 0 {
 		if ctx.n == 0 {
-			return uint32(rng.IntN(len(m.vocab)))
+			return m.drawBase(rng)
 		}
 		return m.sampleFrom(ctx.dropOldest(), rng, temp)
 	}
 	lambda := m.escape(ctx, d)
 	if lambda >= 1 || rng.Float64() < lambda {
 		if ctx.n == 0 {
-			return uint32(rng.IntN(len(m.vocab)))
+			return m.drawBase(rng)
 		}
 		return m.sampleFrom(ctx.dropOldest(), rng, temp)
 	}
 	return d.sampleDisc(rng, m.disc[ctx.n], temp)
+}
+
+// drawBase samples the 0-gram. Without a character model the draw stays
+// inside the vocabulary. With one, a single extra slot spells a new word.
+func (m *Machine) drawBase(rng *rand.Rand) uint32 {
+	n := len(m.vocab)
+	if n == 0 {
+		return 0
+	}
+	if m.chars == nil {
+		return uint32(rng.IntN(n))
+	}
+	slot := rng.IntN(n + 1)
+	if slot < n {
+		return uint32(slot)
+	}
+	if id, ok := m.spellNovel(rng); ok {
+		return id
+	}
+	return uint32(rng.IntN(n))
+}
+
+// spellNovel draws a word from the character model and interns it when
+// the spelling is new. Interning does not count the word.
+func (m *Machine) spellNovel(rng *rand.Rand) (uint32, bool) {
+	if m.chars == nil {
+		return 0, false
+	}
+	for range spellTries {
+		w := m.chars.sampleWord(rng)
+		if w == "" {
+			continue
+		}
+		if _, known := m.ids[w]; known {
+			continue
+		}
+		return m.intern(w), true
+	}
+	return 0, false
+}
+
+// sampleWord writes runes until the end-of-word mark. The word model
+// calls this at temperature 1, whatever temperature it is sampling at.
+func (m *Machine) sampleWord(rng *rand.Rand) string {
+	var ctx context
+	var b strings.Builder
+	for range maxSpell {
+		id, ok := m.sample(ctx, rng, 1)
+		if !ok {
+			return ""
+		}
+		s := m.vocab[id]
+		if s == eow {
+			return b.String()
+		}
+		b.WriteString(s)
+		ctx = ctx.push(id, m.order)
+	}
+	return ""
 }
 
 // Step samples one transition and applies it. The head moves right.
@@ -553,7 +638,8 @@ func (m *Machine) learnParts(parts []string) []uint32 {
 	return ids
 }
 
-// Train tokenizes text and learns it.
+// Train tokenizes text and learns the word model. The character model
+// stays off, so word probabilities keep the uniform unknown bin.
 func (m *Machine) Train(text string) error {
 	parts := Tokenize(text)
 	if len(parts) == 0 {
@@ -561,6 +647,92 @@ func (m *Machine) Train(text string) error {
 	}
 	m.learnParts(parts)
 	return nil
+}
+
+// trainChars learns how each token is spelled. Each token is its own
+// tape, so the character context does not cross a word boundary.
+// Counts stay raw at every length: a repeated spelling stays frequent.
+// Spellings are learned again after a held-out score, on the same
+// schedule as the word counts.
+func (m *Machine) trainChars(parts []string) error {
+	if m.chars == nil {
+		ch, err := New(charOrder)
+		if err != nil {
+			return err
+		}
+		ch.rawLower = true
+		m.chars = ch
+	}
+	m.spellCache = nil
+	buf := make([]uint32, 0, 16)
+	end := m.chars.intern(eow)
+	for _, word := range parts {
+		buf = buf[:0]
+		for _, r := range word {
+			buf = append(buf, m.chars.intern(string(r)))
+		}
+		buf = append(buf, end)
+		m.chars.Learn(buf)
+	}
+	return nil
+}
+
+// spellProb is the character-model probability of writing this spelling
+// and then the end-of-word mark, from an empty character context.
+func (m *Machine) spellProb(word string) float64 {
+	if m.chars == nil {
+		return 0
+	}
+	if m.spellCache == nil {
+		m.spellCache = make(map[string]float64)
+	} else if p, ok := m.spellCache[word]; ok {
+		return p
+	}
+	p := m.chars.sequenceProb(word)
+	m.spellCache[word] = p
+	return p
+}
+
+// sequenceProb multiplies the character conditionals of word and the
+// end-of-word mark. An unseen rune uses the unknown bin.
+func (m *Machine) sequenceProb(word string) float64 {
+	var ctx context
+	logp := 0.0
+	for _, r := range word {
+		id, ok := m.ids[string(r)]
+		if !ok {
+			id = unkID
+		}
+		p := m.prob(ctx, id, 1)
+		if p <= 0 || math.IsNaN(p) || math.IsInf(p, 0) {
+			return 0
+		}
+		logp += math.Log(p)
+		ctx = ctx.push(id, m.order)
+	}
+	id, ok := m.ids[eow]
+	if !ok {
+		id = unkID
+	}
+	p := m.prob(ctx, id, 1)
+	if p <= 0 || math.IsNaN(p) || math.IsInf(p, 0) {
+		return 0
+	}
+	logp += math.Log(p)
+	out := math.Exp(logp)
+	if out == 0 || math.IsNaN(out) {
+		return math.SmallestNonzeroFloat64
+	}
+	return out
+}
+
+// probOOV is the probability of a spelling the word model has not
+// interned. The unknown bin is escaped mass times 1/(|V|+1). Multiplying
+// back by |V|+1 leaves that mass, and the character model spends it on
+// this spelling. Known words are not renormalized, so their probabilities
+// stay put. The result is at most the escaped mass.
+func (m *Machine) probOOV(ctx context, spelling string, temp float64) float64 {
+	return m.prob(ctx, unkID, temp) * float64(len(m.vocab)+1) * m.spellProb(spelling)
 }
 
 // Eval is the average next-symbol score of a held-out slice.
@@ -593,6 +765,9 @@ func (m *Machine) TrainAndScore(text string, holdout, temp float64) (Eval, bool,
 	}
 	if holdout == 0 || len(parts) < 2 {
 		m.learnParts(parts)
+		if err := m.trainChars(parts); err != nil {
+			return Eval{}, false, err
+		}
 		return Eval{}, false, nil
 	}
 	hold := int(math.Round(float64(len(parts)) * holdout))
@@ -604,6 +779,9 @@ func (m *Machine) TrainAndScore(text string, holdout, temp float64) (Eval, bool,
 	}
 	cut := len(parts) - hold
 	prefix := m.learnParts(parts[:cut])
+	if err := m.trainChars(parts[:cut]); err != nil {
+		return Eval{}, false, err
+	}
 	left := prefix
 	if len(left) > m.order {
 		left = append([]uint32(nil), left[len(left)-m.order:]...)
@@ -613,12 +791,17 @@ func (m *Machine) TrainAndScore(text string, holdout, temp float64) (Eval, bool,
 		return Eval{}, false, err
 	}
 	m.learnParts(parts[cut:])
+	if err := m.trainChars(parts[cut:]); err != nil {
+		return Eval{}, false, err
+	}
 	return ev, true, nil
 }
 
 // Score reports the mean negative log2 probability of each symbol in
 // symbols, conditioned on left and then on the symbols already scored.
-// A string the machine has not interned is an unknown symbol.
+// A string the machine has not interned is spelled when that spelling
+// beats the unknown bin, and otherwise keeps the bin. Spelling a new
+// name is usually the more expensive of the two.
 func (m *Machine) Score(left []uint32, symbols []string, temp float64) (Eval, error) {
 	if m.tokens == 0 || len(m.vocab) == 0 {
 		return Eval{}, fmt.Errorf("machine has not learned")
@@ -639,11 +822,19 @@ func (m *Machine) Score(left []uint32, symbols []string, temp float64) (Eval, er
 	oov := 0
 	for _, sym := range symbols {
 		id, ok := m.ids[sym]
+		var p float64
 		if !ok {
 			id = unkID
 			oov++
+			p = m.prob(ctx, unkID, temp)
+			if m.chars != nil {
+				if spelled := m.probOOV(ctx, sym, temp); spelled > p {
+					p = spelled
+				}
+			}
+		} else {
+			p = m.prob(ctx, id, temp)
 		}
-		p := m.prob(ctx, id, temp)
 		if p <= 0 || math.IsNaN(p) || math.IsInf(p, 0) {
 			return Eval{}, fmt.Errorf("non-positive probability for %q", sym)
 		}
