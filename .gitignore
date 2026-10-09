@@ -1,0 +1,17 @@
+# Binaries
+/mtm
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test and coverage output
+*.test
+*.out
+coverage.txt
+coverage.html
+*.coverprofile
+
+# Go workspace
+go.work
+go.work.sum
