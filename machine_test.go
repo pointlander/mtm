@@ -5,6 +5,7 @@
 package main
 
 import (
+	"math"
 	"math/rand/v2"
 	"os"
 	"strings"
@@ -27,19 +28,26 @@ func rng(seed uint64) *rand.Rand {
 	return rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 }
 
-func TestGreedyFollowsUniqueContext(t *testing.T) {
-	m := train(t, 2, "one two three four one two three four")
-	seed, err := m.Encode("one two")
-	if err != nil {
-		t.Fatal(err)
+func TestWittenBellOnceSeen(t *testing.T) {
+	// "a b a c" at order 2. The context (a, b) was seen once, followed
+	// by a. Witten-Bell keeps half the mass on that continuation and
+	// interpolates the rest:
+	//   P(a | a b) = 95/112
+	//   P(b | a b) = 1/16
+	m := train(t, 2, "a b a c")
+	ctx := context{n: 2}
+	ctx.w[0] = m.ids["a"]
+	ctx.w[1] = m.ids["b"]
+	pA := m.prob(ctx, m.ids["a"], 1)
+	pB := m.prob(ctx, m.ids["b"], 1)
+	if math.Abs(pA-95.0/112.0) > 1e-9 {
+		t.Fatalf("P(a|a b)=%v want %v", pA, 95.0/112.0)
 	}
-	got, err := m.Generate(rng(1), seed, 6, 0, 0)
-	if err != nil {
-		t.Fatal(err)
+	if math.Abs(pB-1.0/16.0) > 1e-9 {
+		t.Fatalf("P(b|a b)=%v want %v", pB, 1.0/16.0)
 	}
-	want := "one two three four one two three four"
-	if got != want {
-		t.Fatalf("got %q want %q", got, want)
+	if !(pA < 1 && pA > pB) {
+		t.Fatalf("once-seen continuation was not mixed: P(a)=%v P(b)=%v", pA, pB)
 	}
 }
 
@@ -53,17 +61,29 @@ func TestHeadMovesRight(t *testing.T) {
 	if tape.head != 2 {
 		t.Fatalf("head = %d", tape.head)
 	}
-	if m.vocab[sym] != "blue" {
-		t.Fatalf("wrote %q", m.vocab[sym])
+	if int(sym) >= len(m.vocab) {
+		t.Fatalf("wrote id %d", sym)
 	}
 	if tape.cells[1] != sym {
 		t.Fatal("symbol not on the tape")
 	}
+	ctx := context{n: 1, w: [maxOrder]uint32{m.ids["red"]}}
+	if m.prob(ctx, m.ids["blue"], 1) <= m.prob(ctx, m.ids["red"], 1) {
+		t.Fatal("blue should be more likely after red")
+	}
 }
 
-func TestBackoffAndBothSuccessors(t *testing.T) {
+func TestBothSuccessorsStayLikely(t *testing.T) {
 	m := train(t, 2, "alpha beta gamma alpha beta delta")
 	ctx := context{n: 2, w: [maxOrder]uint32{m.ids["alpha"], m.ids["beta"]}}
+	pGamma := m.prob(ctx, m.ids["gamma"], 1)
+	pDelta := m.prob(ctx, m.ids["delta"], 1)
+	if math.Abs(pGamma-pDelta) > 1e-12 {
+		t.Fatalf("equal counts diverged: gamma %v delta %v", pGamma, pDelta)
+	}
+	if pGamma <= 0 {
+		t.Fatal("missing successor mass")
+	}
 	seen := map[string]int{}
 	r := rng(7)
 	for range 400 {
@@ -73,33 +93,40 @@ func TestBackoffAndBothSuccessors(t *testing.T) {
 		}
 		seen[m.vocab[id]]++
 	}
-	if seen["gamma"] == 0 || seen["delta"] == 0 {
+	if seen["gamma"] < 40 || seen["delta"] < 40 {
 		t.Fatalf("successors = %v", seen)
 	}
-	if len(seen) != 2 {
-		t.Fatalf("unexpected successors %v", seen)
-	}
 
-	// An unseen context falls back to a shorter one that was learned.
+	// An unseen context still writes a known symbol.
 	unseen := context{n: 2, w: [maxOrder]uint32{m.ids["delta"], m.ids["delta"]}}
 	id, ok := m.sample(unseen, r, 0)
 	if !ok {
 		t.Fatal("backoff failed")
 	}
-	if _, known := m.ids[m.vocab[id]]; !known {
-		t.Fatalf("wrote unknown symbol %q", m.vocab[id])
+	if int(id) >= len(m.vocab) {
+		t.Fatalf("wrote id %d", id)
 	}
 }
 
-func TestGreedyPrefersFrequentSuccessor(t *testing.T) {
+func TestFrequentSuccessorMoreLikely(t *testing.T) {
 	m := train(t, 1, "the cat the cat the dog")
 	ctx := context{n: 1, w: [maxOrder]uint32{m.ids["the"]}}
-	id, ok := m.sample(ctx, rng(1), 0)
-	if !ok {
-		t.Fatal("sample failed")
+	if m.prob(ctx, m.ids["cat"], 1) <= m.prob(ctx, m.ids["dog"], 1) {
+		t.Fatal("cat should beat dog after the")
 	}
-	if m.vocab[id] != "cat" {
-		t.Fatalf("got %q", m.vocab[id])
+}
+
+func TestTemperatureChangesProbability(t *testing.T) {
+	m := train(t, 1, "the cat the cat the dog")
+	ctx := context{n: 1, w: [maxOrder]uint32{m.ids["the"]}}
+	hot := m.prob(ctx, m.ids["cat"], 0.5)
+	mid := m.prob(ctx, m.ids["cat"], 1)
+	cold := m.prob(ctx, m.ids["cat"], 2)
+	if hot == mid || mid == cold {
+		t.Fatalf("temperature did not change P(cat|the): %v %v %v", hot, mid, cold)
+	}
+	if !(hot > mid && mid > cold) {
+		t.Fatalf("lower temperature should favor the mode: %v %v %v", hot, mid, cold)
 	}
 }
 
@@ -138,6 +165,86 @@ func TestUnknownPrompt(t *testing.T) {
 	m := train(t, 1, "to be or not")
 	if _, err := m.Encode("banana"); err == nil {
 		t.Fatal("expected unknown token")
+	}
+}
+
+func TestScoreUnknownIsFinite(t *testing.T) {
+	m := train(t, 1, "alpha beta alpha beta alpha")
+	ev, err := m.Score([]uint32{m.ids["alpha"]}, []string{"beta", "notaword"}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ev.OOV != 1 || ev.Tokens != 2 {
+		t.Fatalf("eval %+v", ev)
+	}
+	if math.IsNaN(ev.Bits) || math.IsInf(ev.Bits, 0) || ev.Bits <= 0 {
+		t.Fatalf("bits %v", ev.Bits)
+	}
+	if _, known := m.ids["notaword"]; known {
+		t.Fatal("scoring interned an unknown token")
+	}
+}
+
+func TestTrainAndScore(t *testing.T) {
+	m, err := New(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, ok, err := m.TrainAndScore("aa bb cc dd ee ff gg hh ii zz", 0.2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || ev.Tokens != 2 || ev.OOV != 2 {
+		t.Fatalf("ok %v eval %+v", ok, ev)
+	}
+	if m.tokens != 10 {
+		t.Fatalf("tokens %d", m.tokens)
+	}
+	if _, err := m.Encode("zz"); err != nil {
+		t.Fatal(err)
+	}
+
+	skipped, err := New(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ev, ok, err = skipped.TrainAndScore("one two three", 0, 1)
+	if err != nil || ok || ev.Tokens != 0 || skipped.tokens != 3 {
+		t.Fatalf("ok %v eval %+v tokens %d err %v", ok, ev, skipped.tokens, err)
+	}
+	if _, _, err := skipped.TrainAndScore("one two", 1, 1); err == nil {
+		t.Fatal("expected holdout error")
+	}
+}
+
+func TestHeldOutPatternBeatsNoise(t *testing.T) {
+	easyM, err := New(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	easy, ok, err := easyM.TrainAndScore(strings.Repeat("one two three ", 80), 0.1, 1)
+	if err != nil || !ok {
+		t.Fatal(err, ok)
+	}
+	if easy.OOV != 0 || easy.Bits > 1 {
+		t.Fatalf("pattern %+v", easy)
+	}
+
+	hardM, err := New(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The last fifth is a vocabulary the prefix never used.
+	hardText := strings.Repeat("one two three ", 80) + strings.Repeat("zz yy xx ", 20)
+	hard, ok, err := hardM.TrainAndScore(hardText, 0.2, 1)
+	if err != nil || !ok {
+		t.Fatal(err, ok)
+	}
+	if hard.OOV != 60 {
+		t.Fatalf("oov %d", hard.OOV)
+	}
+	if hard.Bits <= easy.Bits+2 {
+		t.Fatalf("easy %v hard %v", easy.Bits, hard.Bits)
 	}
 }
 
