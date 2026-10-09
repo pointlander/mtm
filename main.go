@@ -66,8 +66,13 @@ func run(file string, order, n, sentences int, temp float64, seed int64, start s
 		return err
 	}
 	if scored {
-		fmt.Fprintf(os.Stderr, "held out %d tokens (%.1f%%): %.3f bits/token, perplexity %.2f, oov %d, temp %g\n",
-			ev.Tokens, holdout*100, ev.Bits, ev.Perplexity, ev.OOV, temp)
+		if ev.KnownTokens > 0 {
+			fmt.Fprintf(os.Stderr, "held out %d tokens (%.1f%%): %.3f bits/token, perplexity %.2f, known %.3f bits/token (%d), oov %d, temp %g\n",
+				ev.Tokens, holdout*100, ev.Bits, ev.Perplexity, ev.KnownBits, ev.KnownTokens, ev.OOV, temp)
+		} else {
+			fmt.Fprintf(os.Stderr, "held out %d tokens (%.1f%%): %.3f bits/token, perplexity %.2f, oov %d, temp %g\n",
+				ev.Tokens, holdout*100, ev.Bits, ev.Perplexity, ev.OOV, temp)
+		}
 	}
 
 	s := seed

@@ -28,26 +28,47 @@ func rng(seed uint64) *rand.Rand {
 	return rand.New(rand.NewPCG(seed, seed^0x9e3779b97f4a7c15))
 }
 
-func TestWittenBellOnceSeen(t *testing.T) {
-	// "a b a c" at order 2. The context (a, b) was seen once, followed
-	// by a. Witten-Bell keeps half the mass on that continuation and
-	// interpolates the rest:
-	//   P(a | a b) = 95/112
-	//   P(b | a b) = 1/16
-	m := train(t, 2, "a b a c")
+func TestKneserNeyDiscount(t *testing.T) {
+	// "a b c a b c a b d" at order 2. The context (a, b) has raw counts
+	// c:2 d:1, so D = n1/(n1+2*n2) = 1/7. Every shorter context was
+	// continued only once, so those levels discount everything away and
+	// the leftover mass is uniform over 4 symbols plus unknown:
+	//   P(c | a b) = 67/105
+	//   P(d | a b) = 32/105
+	m := train(t, 2, "a b c a b c a b d")
 	ctx := context{n: 2}
 	ctx.w[0] = m.ids["a"]
 	ctx.w[1] = m.ids["b"]
-	pA := m.prob(ctx, m.ids["a"], 1)
-	pB := m.prob(ctx, m.ids["b"], 1)
-	if math.Abs(pA-95.0/112.0) > 1e-9 {
-		t.Fatalf("P(a|a b)=%v want %v", pA, 95.0/112.0)
+	pC := m.prob(ctx, m.ids["c"], 1)
+	pD := m.prob(ctx, m.ids["d"], 1)
+	if math.Abs(pC-67.0/105.0) > 1e-9 {
+		t.Fatalf("P(c|a b)=%v want %v", pC, 67.0/105.0)
 	}
-	if math.Abs(pB-1.0/16.0) > 1e-9 {
-		t.Fatalf("P(b|a b)=%v want %v", pB, 1.0/16.0)
+	if math.Abs(pD-32.0/105.0) > 1e-9 {
+		t.Fatalf("P(d|a b)=%v want %v", pD, 32.0/105.0)
 	}
-	if !(pA < 1 && pA > pB) {
-		t.Fatalf("once-seen continuation was not mixed: P(a)=%v P(b)=%v", pA, pB)
+	if pC <= pD {
+		t.Fatalf("frequent continuation lost: P(c)=%v P(d)=%v", pC, pD)
+	}
+}
+
+func TestContinuationNotRawFrequency(t *testing.T) {
+	// b occurs 3 times, always after x, so its continuation count is 1.
+	// a occurs twice, after y and after z, so its continuation count is 2.
+	// The order-1 backoff is the continuation unigram:
+	//   P(a) = 17/54
+	//   P(b) = 8/54
+	m := train(t, 1, "x b x b x b y a z a")
+	pA := m.prob(context{}, m.ids["a"], 1)
+	pB := m.prob(context{}, m.ids["b"], 1)
+	if math.Abs(pA-17.0/54.0) > 1e-9 {
+		t.Fatalf("P(a)=%v want %v", pA, 17.0/54.0)
+	}
+	if math.Abs(pB-8.0/54.0) > 1e-9 {
+		t.Fatalf("P(b)=%v want %v", pB, 8.0/54.0)
+	}
+	if pA <= pB {
+		t.Fatalf("raw frequency won: P(a)=%v P(b)=%v", pA, pB)
 	}
 }
 
@@ -174,11 +195,17 @@ func TestScoreUnknownIsFinite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ev.OOV != 1 || ev.Tokens != 2 {
+	if ev.OOV != 1 || ev.Tokens != 2 || ev.KnownTokens != 1 {
 		t.Fatalf("eval %+v", ev)
 	}
 	if math.IsNaN(ev.Bits) || math.IsInf(ev.Bits, 0) || ev.Bits <= 0 {
 		t.Fatalf("bits %v", ev.Bits)
+	}
+	if math.IsNaN(ev.KnownBits) || math.IsInf(ev.KnownBits, 0) || ev.KnownBits <= 0 {
+		t.Fatalf("known bits %v", ev.KnownBits)
+	}
+	if ev.KnownBits == ev.Bits {
+		t.Fatalf("known bits should exclude the unknown token: %+v", ev)
 	}
 	if _, known := m.ids["notaword"]; known {
 		t.Fatal("scoring interned an unknown token")
